@@ -1,5 +1,6 @@
 ﻿"""Gradio UI and chat handler."""
 import traceback
+from time import perf_counter
 
 import gradio as gr
 
@@ -19,6 +20,19 @@ from Sim import find_failure, generate_simulation_report_pdf, run_simulation, si
 
 # NEW: Imageâ€‘toâ€‘Model parser
 from image_parser import build_summary_from_image, refine_summary_with_user_input
+
+
+def _pipeline_stage(name, action):
+    started = perf_counter()
+    print(f"[PIPELINE] {name} started", flush=True)
+    try:
+        result = action()
+    except Exception:
+        print(f"[PIPELINE] {name} failed after {perf_counter() - started:.2f}s", flush=True)
+        traceback.print_exc()
+        raise
+    print(f"[PIPELINE] {name} completed in {perf_counter() - started:.2f}s", flush=True)
+    return result
 
 
 def run_simulation_with_ml(component_type, temperature, load, load_type, deform_scale):
@@ -80,9 +94,24 @@ def download_simulation_report(component_type, temperature, load, load_type, def
 
 
 def chat_handler(user_message, history):
-    direct_summary = build_direct_summary(user_message)
-    detected_obj = detect_object(user_message)
-    if direct_summary or detected_obj != "unknown":
+    started = perf_counter()
+    history = history or []
+    print("[PIPELINE] Send button triggered", flush=True)
+    print("[PIPELINE] Chat handler started", flush=True)
+    print(f"[PIPELINE] Prompt received: {user_message!r}", flush=True)
+    try:
+        direct_summary = _pipeline_stage("Prompt dimension extraction", lambda: build_direct_summary(user_message or ""))
+        detected_obj = _pipeline_stage("Object identification", lambda: detect_object(user_message or ""))
+        print(f"[PIPELINE] Component identified: {detected_obj.upper()}", flush=True)
+        print(f"[PIPELINE] Numeric dimensions found: {parse_dims(user_message or '')}", flush=True)
+    except Exception as exc:
+        history.extend([
+            {"role": "user", "content": user_message or ""},
+            {"role": "assistant", "content": f"Request processing failed: {exc}"},
+        ])
+        return "", history, None
+
+    if direct_summary or (detected_obj != "unknown" and not (detected_obj in {"pyramid", "flange"} and direct_summary is None)):
         pipeline_input = direct_summary or user_message.strip()
         bot_reply = direct_summary or (
             "Proceeding with generation from your request.\n"
@@ -91,15 +120,25 @@ def chat_handler(user_message, history):
         stl_file = None
         viewer_file = None
         try:
-            stl_file = run_pipeline(pipeline_input)
-            viewer_file = prepare_viewer_model(stl_file) if stl_file else None
+            print("[PIPELINE] Dimensions extracted" if direct_summary else "[PIPELINE] Using prompt dimensions", flush=True)
+            stl_file = _pipeline_stage("CAD generation and STL export", lambda: run_pipeline(pipeline_input))
+            if stl_file:
+                viewer_file = _pipeline_stage("Viewer model preparation", lambda: prepare_viewer_model(stl_file))
+                print(f"[PIPELINE] Viewer updated: {viewer_file}", flush=True)
+            else:
+                print("[PIPELINE] CAD pipeline returned no STL", flush=True)
             # Update sim state with the detected object for simulation tab
             sim_state.last_detected_object = detected_obj if detected_obj != "unknown" else sim_state.last_detected_object
             sim_state.last_dims = parse_dims(pipeline_input)
-            bot_reply += "\n\n**3D model generated!** Check the viewer" if stl_file \
-                         else "\n\nâš ï¸ Generation failed. Please try again."
+            if stl_file and viewer_file:
+                bot_reply += "\n\n**3D model generated!** Check the viewer"
+            elif stl_file:
+                bot_reply += "\n\nThe STL was exported, but the viewer file could not be prepared. Check the terminal log."
+            else:
+                bot_reply += "\n\nâš ï¸ Generation failed. Please try again."
         except Exception as e:
-            print(traceback.format_exc())
+            print(f"[PIPELINE] Chat generation failed after {perf_counter() - started:.2f}s", flush=True)
+            traceback.print_exc()
             bot_reply += f"\n\nError: {str(e)}"
 
         history.append({"role": "user", "content": user_message})
@@ -110,29 +149,45 @@ def chat_handler(user_message, history):
     for msg in history[-MAX_HISTORY_MESSAGES:]:
         if msg["role"] in ("user", "assistant"):
             messages.append({"role": msg["role"], "content": msg["content"]})
-    messages.append({"role": "user", "content": user_message})
+    messages.append({"role": "user", "content": user_message or ""})
 
-    res = client.chat.completions.create(
-        model="qwen2:7b",
-        messages=messages,
-        temperature=0,
-        max_tokens=COLLECTOR_MAX_TOKENS,
-    )
-    bot_reply = res.choices[0].message.content
+    try:
+        res = _pipeline_stage(
+            "Ollama parameter clarification (60s timeout)",
+            lambda: client.with_options(timeout=60.0, max_retries=0).chat.completions.create(
+                model="qwen3:4b",
+                messages=messages,
+                temperature=0,
+                max_tokens=COLLECTOR_MAX_TOKENS,
+            ),
+        )
+        bot_reply = res.choices[0].message.content
+        print("[PIPELINE] Assistant response generated", flush=True)
+    except Exception as exc:
+        bot_reply = f"I couldn't process that request because the parameter assistant failed: {exc}"
 
     stl_file = None
     viewer_file = None
     if "All required parameters collected" in bot_reply:
         try:
-            stl_file = run_pipeline(bot_reply)
-            viewer_file = prepare_viewer_model(stl_file) if stl_file else None
+            stl_file = _pipeline_stage("CAD generation and STL export", lambda: run_pipeline(bot_reply))
+            if stl_file:
+                viewer_file = _pipeline_stage("Viewer model preparation", lambda: prepare_viewer_model(stl_file))
+                print(f"[PIPELINE] Viewer updated: {viewer_file}", flush=True)
+            else:
+                print("[PIPELINE] CAD pipeline returned no STL", flush=True)
             detected = detect_object(bot_reply)
             sim_state.last_detected_object = detected if detected != "unknown" else sim_state.last_detected_object
             sim_state.last_dims = parse_dims(bot_reply)
-            bot_reply += "\n\n**3D model generated!** Check the viewer" if stl_file \
-                         else "\n\n**Generation failed. Please try again.**"
+            if stl_file and viewer_file:
+                bot_reply += "\n\n**3D model generated!** Check the viewer"
+            elif stl_file:
+                bot_reply += "\n\nThe STL was exported, but the viewer file could not be prepared. Check the terminal log."
+            else:
+                bot_reply += "\n\n**Generation failed. Please try again.**"
         except Exception as e:
-            print(traceback.format_exc())
+            print(f"[PIPELINE] Chat generation failed after {perf_counter() - started:.2f}s", flush=True)
+            traceback.print_exc()
             bot_reply += f"\n\n**Error: {str(e)}**"
 
     history.append({"role": "user",      "content": user_message})
@@ -296,6 +351,7 @@ def create_ui():
                         inputs=[user_input, chatbot],
                         outputs=[user_input, chatbot, model_viewer]
                     )
+                    print("[PIPELINE] Gradio Send and Enter events bound to chat_handler", flush=True)
                     clear_btn.click(
                         fn=lambda: (
                             [{"role": "assistant", "content": "Ready for a new design! What would you like to create?"}],

@@ -1,0 +1,13 @@
+build123d
+gradio
+imageio
+matplotlib
+numpy
+opencv-python-headless
+openai
+pandas
+plotly
+pytesseract
+scikit-learn
+trimesh
+easyocr

@@ -26,6 +26,7 @@ import subprocess
 import sys
 import uuid
 import hashlib
+from time import perf_counter
 from openai import OpenAI
 
 # ── Ollama client ──────────────────────────────────────────────────────────
@@ -49,13 +50,36 @@ _CODER_CACHE: dict[str, str] = {}
 _PIPELINE_CACHE: dict[str, str] = {}
 
 
+def _ollama_chat(stage: str, **request_options):
+    started = perf_counter()
+    print(f"[PIPELINE] Ollama {stage} request started (90s timeout)", flush=True)
+    try:
+        response = client.with_options(timeout=90.0, max_retries=0).chat.completions.create(**request_options)
+        print(f"[PIPELINE] Ollama {stage} request completed in {perf_counter() - started:.2f}s", flush=True)
+        return response
+    except Exception:
+        print(f"[PIPELINE] Ollama {stage} request failed after {perf_counter() - started:.2f}s", flush=True)
+        traceback.print_exc()
+        raise
+
+
 def prepare_viewer_model(stl_path: str) -> str | None:
     if not stl_path or not os.path.exists(stl_path):
+        print(f"[PIPELINE] Viewer preparation skipped: STL path is missing ({stl_path!r})", flush=True)
         return None
 
-    viewer_path = os.path.join(MODEL_DIR, f"viewer_{uuid.uuid4().hex}.stl")
-    shutil.copy2(stl_path, viewer_path)
-    return viewer_path.replace("\\", "/")
+    started = perf_counter()
+    try:
+        if os.path.getsize(stl_path) == 0:
+            raise RuntimeError(f"STL export is empty: {stl_path}")
+        viewer_path = os.path.join(MODEL_DIR, f"viewer_{uuid.uuid4().hex}.stl")
+        shutil.copy2(stl_path, viewer_path)
+        print(f"[PIPELINE] Viewer STL ready ({os.path.getsize(viewer_path)} bytes): {viewer_path}; {perf_counter() - started:.2f}s", flush=True)
+        return viewer_path.replace("\\", "/")
+    except Exception:
+        print("[PIPELINE] Viewer preparation failed", flush=True)
+        traceback.print_exc()
+        raise
 # ═══════════════════════════════════════════════════════════════════════════
 #  VERIFIED build123d CODE TEMPLATES (from 1.txt — updated modelling)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -172,6 +196,79 @@ def make_cone(radius, height, stl_path):
         f"with BuildPart() as b:\n"
         f"    Cone(bottom_radius={radius}, top_radius=0, height={height})\n"
         f"export_stl(b.part, '{stl_path}')\n"
+    )
+
+
+def make_pyramid(base_length, base_width, height, stl_path):
+    """Create one closed five-face pyramid solid from its labeled dimensions."""
+    return (
+        "from build123d import *\n"
+        f"base_length = {float(base_length)!r}\n"
+        f"base_width = {float(base_width)!r}\n"
+        f"height = {float(height)!r}\n"
+        "x = base_length / 2.0\n"
+        "y = base_width / 2.0\n"
+        "base_points = [(-x, -y, 0), (x, -y, 0), (x, y, 0), (-x, y, 0)]\n"
+        "apex = (0, 0, height)\n"
+        "faces = [Face(Wire.make_polygon(list(reversed(base_points)), close=True))]\n"
+        "for i in range(4):\n"
+        "    faces.append(Face(Wire.make_polygon([base_points[i], base_points[(i + 1) % 4], apex], close=True)))\n"
+        "pyramid = Solid(Shell(faces))\n"
+        "with BuildPart() as b:\n"
+        "    add(pyramid)\n"
+        f"export_stl(b.part, {stl_path!r})\n"
+    )
+
+
+def make_flange(outer_diameter, base_thickness, hub_diameter, hub_height,
+                bore_diameter, hole_count, hole_diameter, bolt_circle_diameter,
+                stl_path, thread_pitch=None):
+    """Generate a dimension-driven flange with concentric bores and a bolt circle."""
+    parameters = (
+        "from build123d import *\n"
+        "from math import cos, sin, pi\n"
+        f"outer_diameter = {float(outer_diameter)!r}\n"
+        f"base_thickness = {float(base_thickness)!r}\n"
+        f"hub_diameter = {float(hub_diameter)!r}\n"
+        f"hub_height = {float(hub_height)!r}\n"
+        f"bore_diameter = {float(bore_diameter)!r}\n"
+        f"hole_count = {int(hole_count)}\n"
+        f"hole_diameter = {float(hole_diameter)!r}\n"
+        f"bolt_circle_diameter = {float(bolt_circle_diameter)!r}\n"
+    )
+    thread_setting = f"thread_pitch = {float(thread_pitch)!r}\n" if thread_pitch is not None else "thread_pitch = None\n"
+    thread_cutter_code = (
+        "thread_cutter = None\n"
+        "if thread_pitch is not None:\n"
+        "    bore_radius = bore_diameter / 2.0\n"
+        "    radial_depth = max(min(thread_pitch * 0.14, bore_radius * 0.08), 0.05)\n"
+        "    root_overlap = max(radial_depth * 0.45, 0.04)\n"
+        "    thread_path = Helix(pitch=thread_pitch, height=base_thickness + hub_height, radius=bore_radius + root_overlap * 0.20)\n"
+        "    section_plane = Plane(origin=thread_path @ 0, z_dir=thread_path % 0)\n"
+        "    half_pitch = max(thread_pitch * 0.22, radial_depth * 1.5)\n"
+        "    with BuildSketch(section_plane) as thread_section:\n"
+        "        Polygon((-root_overlap, -half_pitch), (-radial_depth, 0), (-root_overlap, half_pitch))\n"
+        "    thread_cutter = sweep(thread_section.sketch, path=thread_path)\n"
+    )
+    return parameters + thread_setting + thread_cutter_code + (
+        "with BuildPart() as b:\n"
+        "    z_min_align = (Align.CENTER, Align.CENTER, Align.MIN)\n"
+        "    Cylinder(outer_diameter / 2.0, base_thickness, align=z_min_align)\n"
+        "    with Locations((0, 0, base_thickness)):\n"
+        "        Cylinder(hub_diameter / 2.0, hub_height, align=z_min_align)\n"
+        "    cut_margin = max(base_thickness * 0.001, 0.01)\n"
+        "    with Locations((0, 0, -cut_margin)):\n"
+        "        Cylinder(bore_diameter / 2.0, base_thickness + hub_height + 2.0 * cut_margin, align=z_min_align, mode=Mode.SUBTRACT)\n"
+        "    bolt_circle_radius = bolt_circle_diameter / 2.0\n"
+        "    for hole_index in range(hole_count):\n"
+        "        angle = 2.0 * pi * hole_index / hole_count\n"
+        "        hole_x = bolt_circle_radius * cos(angle)\n"
+        "        hole_y = bolt_circle_radius * sin(angle)\n"
+        "        with Locations((hole_x, hole_y, -cut_margin)):\n"
+        "            Cylinder(hole_diameter / 2.0, base_thickness + 2.0 * cut_margin, align=z_min_align, mode=Mode.SUBTRACT)\n"
+        "    if thread_cutter is not None:\n"
+        "        add(thread_cutter, mode=Mode.SUBTRACT)\n"
+        f"export_stl(b.part, {stl_path!r})\n"
     )
 
 
@@ -514,6 +611,10 @@ def _requires_four_corners(summary: str) -> bool:
 def detect_object(summary: str) -> str:
     s = summary.lower()
     # High-priority component keywords (must win even if prompt mentions screws/bolts/etc.)
+    if re.search(r"\bflange\b", s) and not re.search(r"\bflange\s+(?:nut|bolt|screw)\b", s):
+        return "flange"
+    if re.search(r"\bpyramid\b", s):
+        return "pyramid"
     if "sphere" in s:
         return "sphere"
     if any(w in s for w in ["spring", "coil spring", "compression spring", "extension spring", "helical spring", "coil"]):
@@ -1071,7 +1172,7 @@ def generate_fallback(summary: str, stl_path: str) -> str:
     lowered = summary.lower()
     is_hex  = "hex" in lowered
 
-    print(f"[Fallback] Object='{obj}'  Dims={dims}  Hex={is_hex}")
+    print(f"[PIPELINE] Component generation route selected: {obj.upper()}; dimensions={dims}; hex={is_hex}", flush=True)
 
     # For bevel gear, call dedicated generator
     if obj == "bevel_gear":
@@ -1210,6 +1311,7 @@ def generate_fallback(summary: str, stl_path: str) -> str:
     elif obj == "cylinder":
         radius = (dims[0] / 2) if len(dims) >= 1 else 10.0
         height = dims[1]        if len(dims) >= 2 else 20.0
+        print(f"[PIPELINE] Cylinder dimensions extracted: diameter={radius * 2.0} mm, height={height} mm", flush=True)
         if "hole" in lowered or "bore" in lowered:
             hole_r = (dims[2] / 2) if len(dims) >= 3 else max(radius * 0.35, 1.0)
             code = make_cylinder_with_hole(radius, height, hole_r, safe_path)
@@ -1327,6 +1429,54 @@ def build_direct_summary(user_message: str) -> str | None:
     obj = detect_object(text)
     dims = parse_dims(text)
     lowered = text.lower()
+
+    if obj == "flange":
+        flange_dims = _extract_flange_parameters(text)
+        if flange_dims is None:
+            return None
+        thread_pitch = flange_dims.pop("thread_pitch")
+        thread_requested = flange_dims.pop("thread_requested")
+        dimensions = (
+            f"Outer Diameter={flange_dims['outer_diameter']}mm, "
+            f"Base Thickness={flange_dims['base_thickness']}mm, "
+            f"Central Hub Diameter={flange_dims['hub_diameter']}mm, "
+            f"Hub Height={flange_dims['hub_height']}mm, "
+            f"Central Bore Diameter={flange_dims['bore_diameter']}mm, "
+            f"Number of Mounting Holes={flange_dims['hole_count']}, "
+            f"Mounting Hole Diameter={flange_dims['hole_diameter']}mm, "
+            f"Bolt Circle Diameter={flange_dims['bolt_circle_diameter']}mm"
+        )
+        if thread_requested:
+            dimensions += f", Thread Pitch={thread_pitch}mm"
+        features = "Internal Helical Threads, " if thread_requested else ""
+        return (
+            "All required parameters collected.\n"
+            "Summary:\n"
+            "- Object: Flange\n"
+            f"- Dimensions: {dimensions}\n"
+            "- Shape: Circular mounting flange\n"
+            f"- Features: {features}Raised hub, central through-bore, circular mounting-hole pattern\n"
+            "Now the design process will be started."
+        )
+
+    if obj == "pyramid":
+        base_length = _extract_labeled_value(text, [r"Base\s+Length", r"Length\s+of\s+Base"])
+        base_width = _extract_labeled_value(text, [r"Base\s+Width", r"Width\s+of\s+Base"])
+        height = _extract_labeled_value(text, [r"Pyramid\s+Height", r"Height"])
+        if base_length is None or base_width is None or height is None:
+            return None
+        if min(base_length, base_width, height) <= 0:
+            return None
+        base_shape = "Square-based" if base_length == base_width else "Rectangular-based"
+        return (
+            "All required parameters collected.\n"
+            "Summary:\n"
+            "- Object: Pyramid\n"
+            f"- Dimensions: Base Length={base_length}mm, Base Width={base_width}mm, Height={height}mm\n"
+            f"- Shape: {base_shape}\n"
+            "- Features: Flat base, four triangular faces, centered sharp apex\n"
+            "Now the design process will be started."
+        )
 
     if obj == "screw":
         if len(dims) < 3:
@@ -1505,6 +1655,53 @@ def build_direct_summary(user_message: str) -> str | None:
     return None
 
 
+def _extract_flange_parameters(summary: str) -> dict | None:
+    """Read required flange values by their labels; never infer from number order."""
+    values = {
+        "outer_diameter": _extract_labeled_value(summary, [r"Outer\s+Diameter", r"Outer\s+Dia(?:meter)?", r"OD"]),
+        "base_thickness": _extract_labeled_value(summary, [r"Base\s+Thickness", r"Flange\s+Thickness", r"Thickness"]),
+        "hub_diameter": _extract_labeled_value(summary, [r"Central\s+Hub\s+Diameter", r"Hub\s+Diameter", r"Hub\s+Dia(?:meter)?"]),
+        "hub_height": _extract_labeled_value(summary, [r"Hub\s+Height"]),
+        "bore_diameter": _extract_labeled_value(summary, [r"Central\s+Bore\s+Diameter", r"Central\s+Bore", r"Bore\s+Diameter", r"Bore\s+Dia(?:meter)?", r"Inner\s+Diameter"]),
+        "hole_count": _extract_labeled_value(summary, [r"Number\s+of\s+Mounting\s+Holes", r"Mounting\s+Hole\s+Count", r"Hole\s+Count", r"Number\s+of\s+Holes"]),
+        "hole_diameter": _extract_labeled_value(summary, [r"Mounting\s+Hole\s+Diameter", r"Mounting\s+Hole\s+Dia(?:meter)?", r"Hole\s+Diameter", r"Hole\s+Dia(?:meter)?"]),
+        "bolt_circle_diameter": _extract_labeled_value(summary, [r"Bolt\s+Circle\s+Diameter(?:\s*\(PCD\))?", r"Bolt\s+Circle\s+Dia(?:meter)?(?:\s*\(PCD\))?", r"Pitch\s+Circle\s+Diameter", r"PCD"]),
+    }
+    thread_pitch = _extract_labeled_value(summary, [r"Thread\s+Pitch"])
+    thread_requested = bool(re.search(r"\bthread(?:ed|s|ing)?\b", summary, flags=re.IGNORECASE))
+    if thread_pitch is None:
+        specification = re.search(r"\bM\s*\d+(?:\.\d+)?\s*[xX\u00D7]\s*(\d+(?:\.\d+)?)\b", summary, flags=re.IGNORECASE)
+        if specification:
+            thread_pitch = float(specification.group(1))
+    values["thread_pitch"] = thread_pitch
+    values["thread_requested"] = thread_requested
+
+    required = tuple(key for key in values if key not in {"thread_pitch", "thread_requested"})
+    missing = [key for key in required if values[key] is None]
+    if missing:
+        print(f"[PIPELINE] Flange dimensions not recognized: {', '.join(missing)}", flush=True)
+        return None
+    if thread_requested and thread_pitch is None:
+        print("[PIPELINE] Flange thread requested without a supplied thread pitch/specification", flush=True)
+        return None
+    if any(float(values[key]) <= 0 for key in required) or (thread_pitch is not None and thread_pitch <= 0):
+        return None
+    if not float(values["hole_count"]).is_integer():
+        return None
+    values["hole_count"] = int(values["hole_count"])
+
+    outer_radius = values["outer_diameter"] / 2.0
+    hub_radius = values["hub_diameter"] / 2.0
+    bore_radius = values["bore_diameter"] / 2.0
+    bolt_radius = values["bolt_circle_diameter"] / 2.0
+    hole_radius = values["hole_diameter"] / 2.0
+    if not (bore_radius < hub_radius < outer_radius):
+        return None
+    if bolt_radius - hole_radius <= hub_radius or bolt_radius + hole_radius > outer_radius:
+        return None
+    return values
+
+
 def should_use_deterministic_pipeline(summary: str) -> bool:
     obj = detect_object(summary)
     if obj == "unknown":
@@ -1564,6 +1761,8 @@ PARAMETERS NEEDED:
 - Boxes/Plates: Length, Width, Height/Thickness; ask if holes are needed.
 - Corner-feature plates: Base Length, Base Width, Base Thickness, Corner Feature Length, Corner Feature Width, Corner Feature Height, and whether all 4 corners are required.
 - Brackets: Base Length, Base Width, Wall Height, Thickness.
+- Pyramids: Base Length, Base Width, Height.
+- Flanges: Outer Diameter, Base Thickness, Central Hub Diameter, Hub Height, Central Bore Diameter, Number of Mounting Holes, Mounting Hole Diameter, and Bolt Circle Diameter. If internal threads are requested, require the thread pitch or a thread specification that includes its pitch; never guess it.
 - Bushings/Shafts: Outer Dia, Inner Dia (if hollow), Length.
 
 COMPLETION FORMAT — respond EXACTLY with:
@@ -1634,8 +1833,9 @@ Output ONLY the structured blueprint (Steps 1–4). No code, no preamble."""
     if cached:
         return cached
 
-    res = client.chat.completions.create(
-        model="qwen2:7b",
+    res = _ollama_chat(
+        "blueprint",
+        model="qwen3:4b",
         messages=[
             {"role": "system", "content": system},
             {"role": "user",   "content": f"Summary:\n{summary}"},
@@ -1745,7 +1945,8 @@ Output ONLY the complete Python script — nothing else."""
     if cached:
         return cached
 
-    res = client.chat.completions.create(
+    res = _ollama_chat(
+        "CAD code generation",
         model="deepseek-coder:6.7b",
         messages=[
             {"role": "system", "content": system},
@@ -2090,6 +2291,8 @@ if not os.path.exists(r"{safe_path}") or os.path.getsize(r"{safe_path}") == 0:
         f.write(clean)
         tmp = f.name
 
+    execution_started = perf_counter()
+    print(f"[PIPELINE] Build123d subprocess started: {sys.executable}", flush=True)
     try:
         if os.path.exists(stl_path):
             os.remove(stl_path)
@@ -2110,8 +2313,17 @@ if not os.path.exists(r"{safe_path}") or os.path.getsize(r"{safe_path}") == 0:
             raise RuntimeError(proc.stderr or "Generated script failed.")
 
         if os.path.exists(stl_path):
+            print(f"[PIPELINE] STL exported ({os.path.getsize(stl_path)} bytes) in {perf_counter() - execution_started:.2f}s: {stl_path}", flush=True)
             return stl_path
         raise RuntimeError("Script ran but no STL was created.")
+    except subprocess.TimeoutExpired:
+        print(f"[PIPELINE] Build123d subprocess timed out after {perf_counter() - execution_started:.2f}s", flush=True)
+        traceback.print_exc()
+        raise
+    except Exception:
+        print(f"[PIPELINE] Build123d subprocess failed after {perf_counter() - execution_started:.2f}s", flush=True)
+        traceback.print_exc()
+        raise
     finally:
         try:
             os.unlink(tmp)
@@ -2125,15 +2337,44 @@ def run_pipeline(summary: str):
     cached_path = _PIPELINE_CACHE.get(cache_id)
     # For spring/rivet/pulley, always regenerate to avoid stale geometry or viewer confusion.
     detected_for_cache = detect_object(normalized_summary)
-    if detected_for_cache not in {"spring", "rivet", "pulley"} and cached_path and os.path.exists(cached_path):
-        if VERBOSE_LOGS:
-            print(f"[MECHAI] Cache hit - {cached_path}")
+    if detected_for_cache not in {"spring", "rivet", "pulley", "pyramid", "flange"} and cached_path and os.path.exists(cached_path):
+        print(f"[PIPELINE] CAD cache hit - {cached_path}", flush=True)
         return cached_path
 
-    print("\n" + "=" * 50 + "\n[MECHAI] Pipeline start\n" + "=" * 50)
+    print("\n" + "=" * 50 + "\n[PIPELINE] CAD pipeline started\n" + "=" * 50, flush=True)
 
     detected_obj = detect_object(summary)
     classified_obj = classify_object(summary)
+    print(f"[PIPELINE] Component identified: {detected_obj.upper()} (class={classified_obj})", flush=True)
+    print(f"[PIPELINE] Numeric dimensions found: {parse_dims(normalized_summary)}", flush=True)
+
+    if detected_obj == "flange":
+        flange_dims = _extract_flange_parameters(normalized_summary)
+        if flange_dims is None:
+            print("[PIPELINE] Flange dimension extraction incomplete or invalid", flush=True)
+            return None
+        print(f"[PIPELINE] Flange dimensions extracted: {flange_dims}", flush=True)
+        thread_pitch = flange_dims.pop("thread_pitch")
+        flange_dims.pop("thread_requested")
+        code = make_flange(**flange_dims, stl_path=STL_PATH.replace("\\", "/"), thread_pitch=thread_pitch)
+        print("[PIPELINE] Flange geometry generation started", flush=True)
+        path = execute_code(code, STL_PATH, normalized_summary)
+        _PIPELINE_CACHE[cache_id] = path
+        print(f"[PIPELINE] Flange geometry generated: {path}", flush=True)
+        return path
+
+    if detected_obj == "pyramid":
+        base_length = _extract_labeled_value(normalized_summary, [r"Base\s+Length", r"Length\s+of\s+Base"])
+        base_width = _extract_labeled_value(normalized_summary, [r"Base\s+Width", r"Width\s+of\s+Base"])
+        height = _extract_labeled_value(normalized_summary, [r"Pyramid\s+Height", r"Height"])
+        if base_length is None or base_width is None or height is None or min(base_length or 0, base_width or 0, height or 0) <= 0:
+            return None
+        code = make_pyramid(base_length, base_width, height, STL_PATH.replace("\\", "/"))
+        print(f"[PIPELINE] Pyramid geometry generation started: {base_length} x {base_width} x {height}", flush=True)
+        path = execute_code(code, STL_PATH, normalized_summary)
+        _PIPELINE_CACHE[cache_id] = path
+        print(f"[Deterministic-Pyramid] SUCCESS - {path}")
+        return path
 
     # ── HARD ROUTE: PULLEY (dimension-driven, no LLM) ────────────────────────
     if detected_obj == "pulley":
@@ -2153,6 +2394,7 @@ def run_pipeline(summary: str):
         flange_t = float(flange_t_in if flange_t_in is not None else (dims[5] if len(dims) >= 6 else face_w * 0.30))
 
         code = make_pulley(outer_d, face_w, bore_d, STL_PATH.replace("\\", "/"), groove_d, hub_d, flange_t)
+        print("[PIPELINE] Pulley geometry generation started", flush=True)
         path = execute_code(code, STL_PATH, normalized_summary)
         _PIPELINE_CACHE[cache_id] = path
         print(f"[Deterministic-Pulley] SUCCESS - {path}")
