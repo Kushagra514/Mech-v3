@@ -1294,8 +1294,20 @@ def generate_specialized_code(summary: str, stl_path: str) -> str | None:
     if cls == "corner_feature_part":
         return generate_corner_feature_part(summary, stl_path)
     if obj == "sphere":
+        dia_val = _extract_labeled_value(summary, [r"\bDiameter\b", r"\bOuter\s+Diameter\b", r"\bDia\b", r"\bD\b"])
+        rad_val = _extract_labeled_value(summary, [r"\bRadius\b", r"\bRad\b", r"\bR\b"])
         dims = parse_dims(summary)
-        diameter = dims[0] if len(dims) >= 1 else 50.0
+        if dia_val is not None:
+            diameter = float(dia_val)
+        elif rad_val is not None:
+            diameter = float(rad_val) * 2.0
+        elif dims:
+            if "radius" in summary.lower() and "diameter" not in summary.lower():
+                diameter = float(dims[0]) * 2.0
+            else:
+                diameter = float(dims[0])
+        else:
+            diameter = 40.0
         return make_sphere(diameter, stl_path)
     if obj == "table":
         return generate_table(summary, stl_path)
@@ -1344,7 +1356,7 @@ def generate_fallback(summary: str, stl_path: str) -> str:
     specialized = generate_specialized_code(summary, safe_path)
     summary_class = classify_object(summary)
     if specialized is not None and (
-        obj in {"table", "gear", "bevel_gear", "helical_gear", "helmet", "frame"}
+        obj in {"sphere", "table", "gear", "bevel_gear", "helical_gear", "helmet", "frame"}
         or summary_class in {"hole_part", "corner_feature_part"}
     ):
         print("[Fallback] Specialized code:\n", specialized)
@@ -1554,6 +1566,22 @@ def generate_fallback(summary: str, stl_path: str) -> str:
         radius = max(float(radius or 10.0), 0.1)
         height = max(float(h_in or 20.0), 0.1)
         code = make_cone(radius, height, safe_path)
+
+    elif obj == "sphere":
+        dia_val = _extract_labeled_value(summary, [r"\bDiameter\b", r"\bOuter\s+Diameter\b", r"\bDia\b", r"\bD\b"])
+        rad_val = _extract_labeled_value(summary, [r"\bRadius\b", r"\bRad\b", r"\bR\b"])
+        if dia_val is not None:
+            diameter = float(dia_val)
+        elif rad_val is not None:
+            diameter = float(rad_val) * 2.0
+        elif dims:
+            if "radius" in lowered and "diameter" not in lowered:
+                diameter = float(dims[0]) * 2.0
+            else:
+                diameter = float(dims[0])
+        else:
+            diameter = 40.0
+        code = make_sphere(diameter, safe_path)
 
     elif obj == "box":
         if "cube" in lowered:
@@ -2594,7 +2622,7 @@ def run_pipeline(summary: str):
     cached_path = _PIPELINE_CACHE.get(cache_id)
     # For spring/rivet/pulley, always regenerate to avoid stale geometry or viewer confusion.
     detected_for_cache = detect_object(normalized_summary)
-    if detected_for_cache not in {"spring", "rivet", "pulley", "pyramid", "flange", "disc_with_holes", "worm_gear"} and cached_path and os.path.exists(cached_path):
+    if detected_for_cache not in {"spring", "rivet", "pulley", "pyramid", "flange", "disc_with_holes", "worm_gear", "sphere"} and cached_path and os.path.exists(cached_path):
         print(f"[PIPELINE] CAD cache hit - {cached_path}", flush=True)
         return cached_path
 
@@ -2604,6 +2632,27 @@ def run_pipeline(summary: str):
     classified_obj = classify_object(summary)
     print(f"[PIPELINE] Component identified: {detected_obj.upper()} (class={classified_obj})", flush=True)
     print(f"[PIPELINE] Numeric dimensions found: {parse_dims(normalized_summary)}", flush=True)
+
+    if detected_obj == "sphere":
+        dia_val = _extract_labeled_value(normalized_summary, [r"\bDiameter\b", r"\bOuter\s+Diameter\b", r"\bDia\b", r"\bD\b"])
+        rad_val = _extract_labeled_value(normalized_summary, [r"\bRadius\b", r"\bRad\b", r"\bR\b"])
+        dims = parse_dims(normalized_summary)
+        if dia_val is not None:
+            diameter = float(dia_val)
+        elif rad_val is not None:
+            diameter = float(rad_val) * 2.0
+        elif dims:
+            if "radius" in normalized_summary.lower() and "diameter" not in normalized_summary.lower():
+                diameter = float(dims[0]) * 2.0
+            else:
+                diameter = float(dims[0])
+        else:
+            diameter = 40.0
+        code = make_sphere(diameter, STL_PATH.replace("\\", "/"))
+        print(f"[PIPELINE] Sphere geometry generation started: diameter={diameter}", flush=True)
+        path = execute_code(code, STL_PATH, normalized_summary)
+        _PIPELINE_CACHE[cache_id] = path
+        return path
 
     if detected_obj == "disc_with_holes":
         disc_dims = _extract_disc_parameters(summary)
