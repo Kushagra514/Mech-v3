@@ -155,7 +155,7 @@ def chat_handler(user_message, history):
         res = _pipeline_stage(
             "Ollama parameter clarification (60s timeout)",
             lambda: client.with_options(timeout=60.0, max_retries=0).chat.completions.create(
-                model="qwen3:4b",
+                model="qwen2.5-coder-finetuned:latest",
                 messages=messages,
                 temperature=0,
                 max_tokens=COLLECTOR_MAX_TOKENS,

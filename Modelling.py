@@ -30,6 +30,7 @@ from time import perf_counter
 from openai import OpenAI
 
 # ── Ollama client ──────────────────────────────────────────────────────────
+LLM_MODEL = __import__("os").getenv("MECH_AI_MODEL", "qwen2.5-coder-finetuned:latest")
 client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
 
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
@@ -219,6 +220,148 @@ def make_pyramid(base_length, base_width, height, stl_path):
         f"export_stl(b.part, {stl_path!r})\n"
     )
 
+
+
+
+def make_disc_with_holes(outer_diameter, height, hole_count, hole_diameter, pcd, stl_path):
+    """Generate a flat cylindrical disc with equally-spaced through-holes on a pitch circle.
+    All inputs in mm.  No central hub or bore required."""
+    outer_r = max(float(outer_diameter) / 2.0, 0.5)
+    h = max(float(height), 0.1)
+    n = max(int(hole_count), 1)
+    hole_r = max(float(hole_diameter) / 2.0, 0.1)
+    pcd_r = max(float(pcd) / 2.0, hole_r + 0.1)
+    cut_margin = max(h * 0.001, 0.01)
+    return (
+        "from build123d import *\n"
+        "from math import cos, sin, pi\n"
+        f"outer_r = {outer_r!r}\n"
+        f"h = {h!r}\n"
+        f"n = {n}\n"
+        f"hole_r = {hole_r!r}\n"
+        f"pcd_r = {pcd_r!r}\n"
+        f"cut_margin = {cut_margin!r}\n"
+        "with BuildPart() as b:\n"
+        "    Cylinder(outer_r, h, align=(Align.CENTER, Align.CENTER, Align.MIN))\n"
+        "    for i in range(n):\n"
+        "        angle = 2.0 * pi * i / n\n"
+        "        cx = pcd_r * cos(angle)\n"
+        "        cy = pcd_r * sin(angle)\n"
+        "        with Locations((cx, cy, -cut_margin)):\n"
+        "            Cylinder(hole_r, h + 2.0 * cut_margin,\n"
+        "                     align=(Align.CENTER, Align.CENTER, Align.MIN),\n"
+        "                     mode=Mode.SUBTRACT)\n"
+        f"export_stl(b.part, {stl_path!r})\n"
+    )
+
+
+def make_worm_gear(diameter, length, pitch, num_starts, stl_path):
+    """Generate the circular worm gear (worm wheel) matching the engineering reference photo.
+    Features:
+      - Circular disc gear wheel matching industrial worm wheel proportions
+      - Angled worm-wheel teeth around the outer rim
+      - Raised central cylindrical hub (collar)
+      - Deep annular recessed web dishes on both sides
+      - Central through-bore with rectangular keyway slot
+    Parametric: Scales with diameter, length, pitch, and num_starts.
+    """
+    import math
+
+    outer_d = max(float(diameter) * 2.0, 20.0)
+    rim_width = max(15.0 * (float(length) / 80.0), 4.0)
+    outer_r = outer_d / 2.0
+
+    p = float(pitch)
+    teeth_count = int(round(math.pi * outer_d / p))
+    teeth_count = max(min(teeth_count, 120), 12)
+
+    tooth_depth = min(max(p * 0.60, 1.2), outer_r * 0.22)
+    root_r = outer_r - tooth_depth
+
+    hub_r = outer_r * 0.44
+    hub_protrusion = max(rim_width * 0.25, 2.0)
+    bore_r = hub_r * 0.58
+    kw_w = max(bore_r * 0.38, 2.0)
+    kw_d = max(bore_r * 0.28, 1.5)
+
+    recess_r_in = hub_r
+    recess_r_out = root_r - max(outer_r * 0.05, 1.5)
+    recess_depth = min(rim_width * 0.32, (rim_width - 2.0) / 2.0)
+
+    twist_total = min(max(3.0 * int(num_starts) * (p / 8.0), 2.0), 35.0)
+    num_sections = 4
+
+    angle_step = 2.0 * math.pi / teeth_count
+    half_tooth_a = (2.0 * math.pi * root_r / teeth_count * 0.44) / (2.0 * outer_r)
+
+    base_points = []
+    for i in range(teeth_count):
+        ac = i * angle_step
+        ra = ac - angle_step * 0.45
+        base_points.append((root_r * math.cos(ra), root_r * math.sin(ra)))
+        base_points.append((outer_r * math.cos(ac - half_tooth_a), outer_r * math.sin(ac - half_tooth_a)))
+        base_points.append((outer_r * math.cos(ac + half_tooth_a), outer_r * math.sin(ac + half_tooth_a)))
+
+    code_lines = [
+        "from build123d import *",
+        "import math",
+        f"rim_width = {rim_width!r}",
+        f"hub_r = {hub_r!r}",
+        f"hub_protrusion = {hub_protrusion!r}",
+        f"bore_r = {bore_r!r}",
+        f"kw_w = {kw_w!r}",
+        f"kw_d = {kw_d!r}",
+        f"recess_r_in = {recess_r_in!r}",
+        f"recess_r_out = {recess_r_out!r}",
+        f"recess_depth = {recess_depth!r}",
+        f"twist_total = {twist_total!r}",
+        f"num_sections = {num_sections!r}",
+        f"base_points = " + repr(base_points),
+        "",
+        "with BuildPart() as b:",
+        "    # 1. Main toothed rim",
+        "    for sec in range(num_sections + 1):",
+        "        t = sec / num_sections",
+        "        z = rim_width * t",
+        "        twist_rad = math.radians(twist_total * (t - 0.5))",
+        "        cos_t = math.cos(twist_rad)",
+        "        sin_t = math.sin(twist_rad)",
+        "        rotated = [(x * cos_t - y * sin_t, x * sin_t + y * cos_t) for x, y in base_points]",
+        "        rotated.append(rotated[0])",
+        "        with BuildSketch(Plane.XY.offset(z)):",
+        "            with BuildLine():",
+        "                Polyline(*rotated, close=True)",
+        "            make_face()",
+        "    loft()",
+        "",
+        "    # 2. Central Hub protruding on both sides (+Z and -Z)",
+        "    with BuildSketch(Plane.XY.offset(-hub_protrusion)):",
+        "        Circle(radius=hub_r)",
+        "    extrude(amount=rim_width + 2.0 * hub_protrusion)",
+        "",
+        "    # 3. Deep Recessed Web (Dish / Pocket) on TOP face (+Z)",
+        "    if recess_depth > 0.5 and recess_r_out > recess_r_in + 1.0:",
+        "        with BuildSketch(Plane.XY.offset(rim_width - recess_depth)):",
+        "            Circle(radius=recess_r_out)",
+        "            Circle(radius=recess_r_in, mode=Mode.SUBTRACT)",
+        "        extrude(amount=recess_depth + 0.1, mode=Mode.SUBTRACT)",
+        "",
+        "        # 4. Deep Recessed Web (Dish / Pocket) on BOTTOM face (-Z)",
+        "        with BuildSketch(Plane.XY):",
+        "            Circle(radius=recess_r_out)",
+        "            Circle(radius=recess_r_in, mode=Mode.SUBTRACT)",
+        "        extrude(amount=recess_depth + 0.1, mode=Mode.SUBTRACT, dir=(0,0,-1))",
+        "",
+        "    # 5. Through Bore + Keyway",
+        "    with BuildSketch(Plane.XY.offset(-hub_protrusion - 2.0)):",
+        "        Circle(radius=bore_r)",
+        "        with Locations((0.0, bore_r)):",
+        "            Rectangle(kw_w, kw_d * 2.0)",
+        "    extrude(amount=rim_width + 2.0 * hub_protrusion + 4.0, mode=Mode.SUBTRACT)",
+        "",
+        f"export_stl(b.part, {stl_path!r})",
+    ]
+    return "\n".join(code_lines) + "\n"
 
 def make_flange(outer_diameter, base_thickness, hub_diameter, hub_height,
                 bore_diameter, hole_count, hole_diameter, bolt_circle_diameter,
@@ -623,6 +766,9 @@ def detect_object(summary: str) -> str:
         return "rivet"
     if _has_corner_feature_request(s):
         return "plate"
+    # Worm gear / worm screw -- MUST come before generic "screw" check
+    if re.search(r"\bworm\b", s):
+        return "worm_gear"
     if any(w in s for w in ["screw", "machine screw", "wood screw", "self-tapping"]):
         return "screw"
     if any(w in s for w in ["bolt", "hex bolt", "carriage bolt", "stud bolt"]):
@@ -643,6 +789,9 @@ def detect_object(summary: str) -> str:
         return "shaft"
     if any(w in s for w in ["pulley", "sheave", "v-belt pulley", "belt pulley"]):
         return "pulley"
+    # Cylindrical disc with holes (must come before generic cylinder)
+    if re.search(r"\b(?:disc|disk)\b", s) or re.search(r"\bcylindrical\s+dis[ck]\b", s):
+        return "disc_with_holes"
     if any(w in s for w in ["cylinder", "rod", "pipe", "tube"]):
         return "cylinder"
     if any(w in s for w in ["gear", "tooth", "teeth"]):
@@ -1222,9 +1371,20 @@ def generate_fallback(summary: str, stl_path: str) -> str:
         code = make_hex_bolt(shaft_r, head_r, shaft_len, head_h, safe_path)
 
     elif obj in ("nut", "washer"):
-        inner_r   = (dims[0] / 2) if len(dims) >= 1 else 5.0
-        outer_r   = (dims[1] / 2) if len(dims) >= 2 else inner_r * 2.0
-        thickness = dims[2]        if len(dims) >= 3 else 5.0
+        outer_d = _extract_labeled_value(summary, [r"Outer\s+Dia(?:meter)?", r"OD"])
+        inner_d = _extract_labeled_value(summary, [r"Inner\s+Dia(?:meter)?", r"ID", r"Hole\s+Dia(?:meter)?", r"Bore\s+Dia(?:meter)?", r"Central\s+Hole"])
+        thick_d = _extract_labeled_value(summary, [r"Thickness", r"Height"])
+
+        d1 = (dims[0] / 2.0) if len(dims) >= 1 else 5.0
+        d2 = (dims[1] / 2.0) if len(dims) >= 2 else d1 * 2.0
+        inner_r = (inner_d / 2.0) if inner_d is not None else min(d1, d2)
+        outer_r = (outer_d / 2.0) if outer_d is not None else max(d1, d2)
+        if inner_r >= outer_r:
+            inner_r, outer_r = min(inner_r, outer_r), max(inner_r, outer_r)
+            if inner_r == outer_r:
+                inner_r = outer_r * 0.4
+        thickness = thick_d if thick_d is not None else (dims[2] if len(dims) >= 3 else 5.0)
+
         if obj == "washer":
             code = make_washer(inner_r, outer_r, thickness, safe_path)
         elif is_hex:
@@ -1652,6 +1812,57 @@ def build_direct_summary(user_message: str) -> str | None:
             "Now the design process will be started."
         )
 
+    if obj == "disc_with_holes":
+        outer_dia  = _extract_labeled_value(text, [r"Outer\s+Dia(?:meter)?", r"Outer\s+Diameter", r"Diameter"])
+        height_val = _extract_labeled_value(text, [r"Height", r"Thickness"])
+        hole_count = _extract_labeled_value(text, [r"Number\s+of\s+(?:surrounding\s+)?[Hh]oles", r"Hole\s+Count", r"Number\s+of\s+Holes"])
+        hole_dia   = _extract_labeled_value(text, [r"Hole\s+Dia(?:meter)?", r"Hole\s+Diameter"])
+        pcd        = _extract_labeled_value(text, [r"(?:Hole\s+)?Pitch\s+Circle\s+Dia(?:meter)?", r"PCD", r"Bolt\s+Circle\s+Dia(?:meter)?", r"Pitch\s+Circle"])
+        # fall back to positional dims
+        if outer_dia is None and len(dims) >= 1: outer_dia = dims[0]
+        if height_val is None and len(dims) >= 2: height_val = dims[1]
+        if hole_count is None and len(dims) >= 3: hole_count = dims[2]
+        if hole_dia is None and len(dims) >= 4: hole_dia = dims[3]
+        if pcd is None and len(dims) >= 5: pcd = dims[4]
+        if None in (outer_dia, height_val, hole_count, hole_dia, pcd):
+            return None
+        if min(float(outer_dia), float(height_val), float(hole_dia), float(pcd)) <= 0:
+            return None
+        return (
+            "All required parameters collected.\n"
+            "Summary:\n"
+            "- Object: Cylindrical Disc with Holes\n"
+            f"- Dimensions: Outer Diameter={outer_dia}mm, Height={height_val}mm, "
+            f"Number of Holes={int(hole_count)}, Hole Diameter={hole_dia}mm, "
+            f"Pitch Circle Diameter={pcd}mm\n"
+            "- Shape: Circular disc\n"
+            "- Features: Equally-spaced through-holes on pitch circle\n"
+            "Now the design process will be started."
+        )
+
+    if obj == "worm_gear":
+        diameter_val = _extract_labeled_value(text, [r"Outer\s+Dia(?:meter)?", r"Diameter", r"Dia(?:meter)?"])
+        length_val   = _extract_labeled_value(text, [r"Length"])
+        pitch_val    = _extract_labeled_value(text, [r"Pitch"])
+        starts_val   = _extract_labeled_value(text, [r"Number\s+of\s+Starts?", r"Starts?"])
+        if diameter_val is None and len(dims) >= 1: diameter_val = dims[0]
+        if length_val is None and len(dims) >= 2: length_val = dims[1]
+        if pitch_val is None and len(dims) >= 3: pitch_val = dims[2]
+        if starts_val is None and len(dims) >= 4: starts_val = dims[3]
+        if None in (diameter_val, length_val, pitch_val, starts_val):
+            return None
+        lead = float(pitch_val) * int(starts_val)
+        return (
+            "All required parameters collected.\n"
+            "Summary:\n"
+            "- Object: Worm Gear (Worm Screw)\n"
+            f"- Dimensions: Diameter={diameter_val}mm, Length={length_val}mm, "
+            f"Pitch={pitch_val}mm, Number of Starts={int(starts_val)}, Lead={lead}mm\n"
+            "- Shape: Helical Worm\n"
+            "- Features: Multi-start helical thread profile\n"
+            "Now the design process will be started."
+        )
+
     return None
 
 
@@ -1708,7 +1919,7 @@ def should_use_deterministic_pipeline(summary: str) -> bool:
         return False
 
     # Always use deterministic generators for these primitives/components.
-    if obj in {"spring", "rivet", "cone", "pulley", "hinge"}:
+    if obj in {"spring", "rivet", "cone", "pulley", "hinge", "disc_with_holes", "worm_gear", "washer", "sphere"}:
         return True
 
     s = summary.lower()
@@ -1835,7 +2046,7 @@ Output ONLY the structured blueprint (Steps 1–4). No code, no preamble."""
 
     res = _ollama_chat(
         "blueprint",
-        model="qwen3:4b",
+        model=LLM_MODEL,
         messages=[
             {"role": "system", "content": system},
             {"role": "user",   "content": f"Summary:\n{summary}"},
@@ -1947,7 +2158,7 @@ Output ONLY the complete Python script — nothing else."""
 
     res = _ollama_chat(
         "CAD code generation",
-        model="deepseek-coder:6.7b",
+        model=LLM_MODEL,
         messages=[
             {"role": "system", "content": system},
             {"role": "user",   "content": blueprint},
@@ -2031,7 +2242,7 @@ def validate(summary: str, code: str) -> str:
         if extrude_count < 1:
             return "thread_replaces_shaft"
 
-    if "gear" in s and "helical" not in s and "polarlocations" not in code_lower:
+    if "gear" in s and "helical" not in s and "polarlocations" not in code_lower and "polyline" not in code_lower and "polygon" not in code_lower and "gear_points" not in code_lower:
         return "missing_gear_pattern"
 
     # Hole-pattern validation only triggers for explicit hole-pattern requests.
@@ -2066,6 +2277,8 @@ THREAD_TRIGGER_KEYWORDS = ("thread", "threaded", "screw", "bolt", "stud", "nut")
 
 def threads_required(summary: str) -> bool:
     s = summary.lower()
+    if "worm" in s or "gear" in s:
+        return False
     return any(keyword in s for keyword in THREAD_TRIGGER_KEYWORDS)
 
 
@@ -2146,6 +2359,9 @@ def infer_thread_parameters(summary: str) -> dict | None:
 
 
 def inject_thread_postprocessing(code: str, summary: str, stl_path: str) -> str:
+    obj = detect_object(summary)
+    if obj in {"worm_gear", "gear", "bevel_gear", "helical_gear", "disc_with_holes"}:
+        return patch_export(code, stl_path)
     params = infer_thread_parameters(summary)
     if not params:
         return patch_export(code, stl_path)
@@ -2331,13 +2547,54 @@ if not os.path.exists(r"{safe_path}") or os.path.getsize(r"{safe_path}") == 0:
             pass
 
 
+
+def _extract_disc_parameters(summary: str) -> dict | None:
+    """Extract disc-with-holes dimensions from a summary string."""
+    dims = parse_dims(summary)
+    outer_dia  = _extract_labeled_value(summary, [r"Outer\s+Dia(?:meter)?", r"Outer\s+Diameter", r"Diameter"])
+    height_val = _extract_labeled_value(summary, [r"Height", r"Thickness"])
+    hole_count = _extract_labeled_value(summary, [r"Number\s+of\s+(?:surrounding\s+)?[Hh]oles", r"Hole\s+Count", r"Number\s+of\s+Holes"])
+    hole_dia   = _extract_labeled_value(summary, [r"Hole\s+Dia(?:meter)?", r"Hole\s+Diameter"])
+    pcd        = _extract_labeled_value(summary, [r"(?:Hole\s+)?Pitch\s+Circle\s+Dia(?:meter)?", r"PCD", r"Bolt\s+Circle\s+Dia(?:meter)?", r"Pitch\s+Circle"])
+    if outer_dia is None and len(dims) >= 1: outer_dia = dims[0]
+    if height_val is None and len(dims) >= 2: height_val = dims[1]
+    if hole_count is None and len(dims) >= 3: hole_count = dims[2]
+    if hole_dia is None and len(dims) >= 4: hole_dia = dims[3]
+    if pcd is None and len(dims) >= 5: pcd = dims[4]
+    if None in (outer_dia, height_val, hole_count, hole_dia, pcd):
+        return None
+    if min(float(outer_dia), float(height_val), float(hole_dia), float(pcd)) <= 0:
+        return None
+    return dict(outer_diameter=float(outer_dia), height=float(height_val),
+                hole_count=int(hole_count), hole_diameter=float(hole_dia), pcd=float(pcd))
+
+
+def _extract_worm_parameters(summary: str) -> dict | None:
+    """Extract worm gear dimensions from a summary string."""
+    dims = parse_dims(summary)
+    diameter_val = _extract_labeled_value(summary, [r"Outer\s+Dia(?:meter)?", r"Diameter", r"Dia(?:meter)?"])
+    length_val   = _extract_labeled_value(summary, [r"Length", r"Thickness", r"Face\s+width", r"Width", r"Height"])
+    pitch_val    = _extract_labeled_value(summary, [r"Pitch", r"Module"])
+    starts_val   = _extract_labeled_value(summary, [r"Number\s+of\s+Starts?", r"Starts?"])
+    if diameter_val is None and len(dims) >= 1: diameter_val = dims[0]
+    if length_val is None and len(dims) >= 2: length_val = dims[1]
+    if pitch_val is None and len(dims) >= 3: pitch_val = dims[2]
+    if starts_val is None and len(dims) >= 4: starts_val = dims[3]
+    if diameter_val is None: diameter_val = 40.0
+    if length_val is None: length_val = 80.0
+    if pitch_val is None: pitch_val = 8.0
+    if starts_val is None: starts_val = 2
+    return dict(diameter=float(diameter_val), length=float(length_val),
+                pitch=float(pitch_val), num_starts=int(starts_val))
+
+
 def run_pipeline(summary: str):
     normalized_summary = " ".join(summary.strip().split())
     cache_id = _cache_key("pipeline", normalized_summary.lower())
     cached_path = _PIPELINE_CACHE.get(cache_id)
     # For spring/rivet/pulley, always regenerate to avoid stale geometry or viewer confusion.
     detected_for_cache = detect_object(normalized_summary)
-    if detected_for_cache not in {"spring", "rivet", "pulley", "pyramid", "flange"} and cached_path and os.path.exists(cached_path):
+    if detected_for_cache not in {"spring", "rivet", "pulley", "pyramid", "flange", "disc_with_holes", "worm_gear"} and cached_path and os.path.exists(cached_path):
         print(f"[PIPELINE] CAD cache hit - {cached_path}", flush=True)
         return cached_path
 
@@ -2347,6 +2604,18 @@ def run_pipeline(summary: str):
     classified_obj = classify_object(summary)
     print(f"[PIPELINE] Component identified: {detected_obj.upper()} (class={classified_obj})", flush=True)
     print(f"[PIPELINE] Numeric dimensions found: {parse_dims(normalized_summary)}", flush=True)
+
+    if detected_obj == "disc_with_holes":
+        disc_dims = _extract_disc_parameters(summary)
+        if disc_dims is not None:
+            code = make_disc_with_holes(**disc_dims, stl_path=STL_PATH)
+            return execute_code(code, STL_PATH, summary)
+
+    if detected_obj == "worm_gear":
+        worm_dims = _extract_worm_parameters(summary)
+        if worm_dims is not None:
+            code = make_worm_gear(**worm_dims, stl_path=STL_PATH)
+            return execute_code(code, STL_PATH, summary)
 
     if detected_obj == "flange":
         flange_dims = _extract_flange_parameters(normalized_summary)
